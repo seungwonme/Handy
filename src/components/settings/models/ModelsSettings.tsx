@@ -411,7 +411,11 @@ export const ModelsSettings: React.FC = () => {
               status={getModelStatus(model.id)}
               onSelect={handleModelSelect}
               onDownload={handleModelDownload}
-              onDelete={handleModelDelete}
+              onDelete={
+                model.engine_type === "AppleSpeech"
+                  ? undefined
+                  : handleModelDelete
+              }
               onCancel={handleModelCancel}
               downloadProgress={getDownloadProgress(model.id)}
               downloadSpeed={getDownloadSpeed(model.id)}

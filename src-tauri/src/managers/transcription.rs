@@ -38,6 +38,121 @@ use transcribe_rs::{
 
 const STREAM_PERF_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const STREAM_FINALIZE_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+const QWEN_LONG_AUDIO_TARGET_SAMPLES: usize = 25 * 16_000;
+const QWEN_LONG_AUDIO_MAX_SAMPLES: usize = 30 * 16_000;
+const QWEN_SILENCE_WINDOW_SAMPLES: usize = 16_000 / 10;
+const QWEN_SILENCE_SCAN_STEP_SAMPLES: usize = 16_000 / 100;
+
+fn should_chunk_qwen_audio(is_qwen3_asr: bool, audio_len: usize) -> bool {
+    is_qwen3_asr && audio_len > QWEN_LONG_AUDIO_MAX_SAMPLES
+}
+
+fn qwen_long_audio_ranges(audio: &[f32]) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+
+    while audio.len().saturating_sub(start) > QWEN_LONG_AUDIO_MAX_SAMPLES {
+        let search_start = start + QWEN_LONG_AUDIO_TARGET_SAMPLES;
+        let search_end = (start + QWEN_LONG_AUDIO_MAX_SAMPLES).min(audio.len());
+        let last_window_start = search_end.saturating_sub(QWEN_SILENCE_WINDOW_SAMPLES);
+
+        let mut quietest_start = search_start;
+        let mut quietest_score = f32::INFINITY;
+        let mut candidate = search_start;
+        while candidate <= last_window_start {
+            let score = audio[candidate..candidate + QWEN_SILENCE_WINDOW_SAMPLES]
+                .iter()
+                .map(|sample| sample.abs())
+                .sum::<f32>();
+            if score < quietest_score {
+                quietest_score = score;
+                quietest_start = candidate;
+            }
+            candidate += QWEN_SILENCE_SCAN_STEP_SAMPLES;
+        }
+
+        let cut = (quietest_start + QWEN_SILENCE_WINDOW_SAMPLES / 2).min(search_end);
+        ranges.push(start..cut);
+        start = cut;
+    }
+
+    if start < audio.len() {
+        ranges.push(start..audio.len());
+    }
+    ranges
+}
+
+fn transcribe_qwen_long_audio<F>(
+    audio: &[f32],
+    ranges: &[std::ops::Range<usize>],
+    mut transcribe_chunk: F,
+) -> Result<(String, Option<String>)>
+where
+    F: FnMut(&[f32]) -> Result<(String, Option<String>)>,
+{
+    let mut transcripts = Vec::new();
+    let mut language_sample_counts: Vec<(String, usize)> = Vec::new();
+    for range in ranges {
+        let range_len = range.end - range.start;
+        let (text, detected_language) = transcribe_chunk(&audio[range.clone()])?;
+        let text = text.trim();
+        if !text.is_empty() {
+            transcripts.push(text.to_string());
+        }
+
+        if let Some(language) = detected_language {
+            if let Some((_, sample_count)) = language_sample_counts
+                .iter_mut()
+                .find(|(candidate, _)| candidate == &language)
+            {
+                *sample_count += range_len;
+            } else {
+                language_sample_counts.push((language, range_len));
+            }
+        }
+    }
+
+    let mut detected_language = None;
+    let mut detected_language_samples = 0;
+    for (language, sample_count) in language_sample_counts {
+        if sample_count > detected_language_samples {
+            detected_language = Some(language);
+            detected_language_samples = sample_count;
+        }
+    }
+
+    Ok((transcripts.join(" "), detected_language))
+}
+
+fn apple_speech_locale(selected_language: &str, app_language: &str) -> String {
+    let code = if selected_language == "auto" || selected_language.is_empty() {
+        app_language
+    } else {
+        selected_language
+    };
+    if code.contains('-') {
+        return code.to_string();
+    }
+    match code {
+        "ko" => "ko-KR".to_string(),
+        "en" => "en-US".to_string(),
+        "ja" => "ja-JP".to_string(),
+        "zh" => "zh-CN".to_string(),
+        "yue" => "zh-HK".to_string(),
+        "es" => "es-ES".to_string(),
+        "fr" => "fr-FR".to_string(),
+        "de" => "de-DE".to_string(),
+        "it" => "it-IT".to_string(),
+        "pt" => "pt-BR".to_string(),
+        "ru" => "ru-RU".to_string(),
+        "vi" => "vi-VN".to_string(),
+        "th" => "th-TH".to_string(),
+        "id" => "id-ID".to_string(),
+        "ar" => "ar-SA".to_string(),
+        "hi" => "hi-IN".to_string(),
+        other => other.to_string(),
+    }
+}
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
@@ -188,6 +303,8 @@ enum LoadedEngine {
     GigaAM(GigaAMModel),
     Canary(CanaryModel),
     Cohere(CohereModel),
+    /// macOS 26+ SpeechAnalyzer. No model file; the system speech model is used.
+    AppleSpeech,
 }
 
 /// RAII guard that clears the `is_loading` flag and notifies waiters on drop.
@@ -517,7 +634,11 @@ impl TranscriptionManager {
             return Err(anyhow::anyhow!(error_msg));
         }
 
-        let model_path = self.model_manager.get_model_path(model_id)?;
+        let model_path = if matches!(model_info.engine_type, EngineType::AppleSpeech) {
+            std::path::PathBuf::new()
+        } else {
+            self.model_manager.get_model_path(model_id)?
+        };
 
         // Drop the current engine BEFORE building the new one so transcribe-cpp
         // frees the previous native context first — avoids holding two models at
@@ -695,6 +816,27 @@ impl TranscriptionManager {
                 })?;
                 LoadedEngine::Cohere(engine)
             }
+            EngineType::AppleSpeech => {
+                #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                {
+                    if !crate::apple_speech::is_available() {
+                        let error_msg =
+                            "Apple Speech requires macOS 26 or later with SpeechAnalyzer"
+                                .to_string();
+                        emit_loading_failed(&error_msg);
+                        return Err(anyhow::anyhow!(error_msg));
+                    }
+                    info!("Loaded Apple SpeechAnalyzer engine");
+                    LoadedEngine::AppleSpeech
+                }
+                #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                {
+                    let error_msg =
+                        "Apple Speech is only available on Apple Silicon macOS".to_string();
+                    emit_loading_failed(&error_msg);
+                    return Err(anyhow::anyhow!(error_msg));
+                }
+            }
         };
 
         // Update the current engine and model ID
@@ -775,6 +917,7 @@ impl TranscriptionManager {
             Some(LoadedEngine::TranscribeCpp(session)) => {
                 Some(session.model().backend().to_string())
             }
+            Some(LoadedEngine::AppleSpeech) => Some("apple-speech".to_string()),
             Some(_) => Some("onnx".to_string()),
             None => None,
         }
@@ -1236,6 +1379,10 @@ impl TranscriptionManager {
         // with INVALID_ARG, so the whisper extension must be gated on the
         // arch, not on the feature (see #1601).
         let mut model_is_whisper = false;
+        // Qwen3-ASR's transcribe-cpp decoder has a 256-token per-run generation
+        // budget. Long, dense speech must be split before decode or the whole
+        // run returns OUTPUT_TRUNCATED (status 18).
+        let mut model_is_qwen3_asr = false;
 
         // Perform transcription with the appropriate engine.
         // We use catch_unwind to prevent engine panics from poisoning the mutex,
@@ -1277,6 +1424,7 @@ impl TranscriptionManager {
                 let caps = model.capabilities();
                 model_takes_initial_prompt = model.supports(Feature::InitialPrompt);
                 model_is_whisper = model.arch() == "whisper";
+                model_is_qwen3_asr = model.arch() == "qwen3_asr";
                 model_supports_translate = caps.supports_translate;
                 model_languages = caps.languages;
                 debug!(
@@ -1330,17 +1478,36 @@ impl TranscriptionManager {
                             run_options.family.is_some()
                         );
 
-                        session
-                            .run(&audio, &run_options)
-                            .map(|t| {
+                        let mut run_chunk = |pcm: &[f32]| {
+                            session
+                                .run(pcm, &run_options)
+                                .map(|t| (t.text, t.language))
+                                .map_err(|e| {
+                                    anyhow::anyhow!("transcribe-cpp transcription failed: {}", e)
+                                })
+                        };
+
+                        if should_chunk_qwen_audio(model_is_qwen3_asr, audio.len()) {
+                            let ranges = qwen_long_audio_ranges(&audio);
+                            info!(
+                                "Qwen long-audio mode: splitting {:.2}s into {} silence-aware chunks",
+                                audio.len() as f64 / 16_000.0,
+                                ranges.len()
+                            );
+                            transcribe_qwen_long_audio(&audio, &ranges, &mut run_chunk).map(
+                                |(text, detected_language)| {
+                                    model_detected_language = detected_language;
+                                    text
+                                },
+                            )
+                        } else {
+                            run_chunk(&audio).map(|(text, detected_language)| {
                                 // Whisper's audio-based LID (auto mode only;
                                 // `None` when a language hint was passed).
-                                model_detected_language = t.language;
-                                t.text
+                                model_detected_language = detected_language;
+                                text
                             })
-                            .map_err(|e| {
-                                anyhow::anyhow!("transcribe-cpp transcription failed: {}", e)
-                            })
+                        }
                     }
                     LoadedEngine::Parakeet(parakeet_engine) => {
                         let params = ParakeetParams {
@@ -1418,6 +1585,26 @@ impl TranscriptionManager {
                             .transcribe(&audio, &options)
                             .map(|r| r.text)
                             .map_err(|e| anyhow::anyhow!("Cohere transcription failed: {}", e))
+                    }
+                    LoadedEngine::AppleSpeech => {
+                        let locale =
+                            apple_speech_locale(&validated_language, &settings.app_language);
+                        applied_language_hint = Some(locale.clone());
+                        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+                        {
+                            crate::apple_speech::transcribe_samples(
+                                &audio,
+                                16_000,
+                                &locale,
+                                &settings.custom_words,
+                            )
+                        }
+                        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+                        {
+                            Err(anyhow::anyhow!(
+                                "Apple Speech is only available on Apple Silicon macOS"
+                            ))
+                        }
                     }
                 }
             }));
@@ -2143,6 +2330,104 @@ mod tests {
 
     fn languages(codes: &[&str]) -> Vec<String> {
         codes.iter().map(|code| (*code).to_string()).collect()
+    }
+
+    #[test]
+    fn qwen_long_audio_ranges_cover_every_sample_with_thirty_second_cap() {
+        let audio = vec![0.25_f32; 1_530_720];
+
+        let ranges = qwen_long_audio_ranges(&audio);
+
+        assert!(ranges.len() > 1);
+        assert_eq!(ranges.first().unwrap().start, 0);
+        assert_eq!(ranges.last().unwrap().end, audio.len());
+        assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+        assert!(ranges
+            .iter()
+            .all(|range| range.end - range.start <= 30 * 16_000));
+    }
+
+    #[test]
+    fn qwen_long_audio_ranges_prefer_quiet_boundary_before_hard_cap() {
+        let mut audio = vec![0.5_f32; 40 * 16_000];
+        audio[27 * 16_000..28 * 16_000].fill(0.0);
+
+        let ranges = qwen_long_audio_ranges(&audio);
+
+        assert!((27 * 16_000..=28 * 16_000).contains(&ranges[0].end));
+    }
+
+    #[test]
+    fn qwen_long_audio_transcribes_each_range_and_joins_non_empty_text() {
+        let audio = vec![0.5_f32; 61 * 16_000];
+        let mut calls = 0;
+
+        let ranges = qwen_long_audio_ranges(&audio);
+        let (text, _) = transcribe_qwen_long_audio(&audio, &ranges, |_| {
+            calls += 1;
+            Ok((format!("chunk-{calls}"), None))
+        })
+        .unwrap();
+
+        assert_eq!(calls, 3);
+        assert_eq!(text, "chunk-1 chunk-2 chunk-3");
+    }
+
+    #[test]
+    fn qwen_long_audio_language_detection_prefers_more_audio_and_ignores_none() {
+        let audio = vec![0.5_f32; 30 * 16_000 + 1];
+        let ranges = qwen_long_audio_ranges(&audio);
+        assert_eq!(ranges.len(), 2);
+
+        let mut calls = 0;
+        let (_, language) = transcribe_qwen_long_audio(&audio, &ranges, |_| {
+            calls += 1;
+            Ok((String::new(), (calls == 1).then(|| "ko".to_string())))
+        })
+        .unwrap();
+        assert_eq!(language.as_deref(), Some("ko"));
+
+        calls = 0;
+        let (_, language) = transcribe_qwen_long_audio(&audio, &ranges, |_| {
+            calls += 1;
+            let language = if calls == 1 { "ko" } else { "en" };
+            Ok((String::new(), Some(language.to_string())))
+        })
+        .unwrap();
+        assert_eq!(language.as_deref(), Some("ko"));
+    }
+
+    #[test]
+    fn qwen_long_audio_stops_on_chunk_error_without_partial_result() {
+        let audio = vec![0.5_f32; 61 * 16_000];
+        let ranges = qwen_long_audio_ranges(&audio);
+        let mut calls = 0;
+
+        let result = transcribe_qwen_long_audio(&audio, &ranges, |_| {
+            calls += 1;
+            if calls == 2 {
+                anyhow::bail!("chunk failed");
+            }
+            Ok((format!("chunk-{calls}"), Some("ko".to_string())))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn qwen_long_audio_chunking_gate_excludes_short_and_non_qwen_audio() {
+        assert!(should_chunk_qwen_audio(true, 31 * 16_000));
+        assert!(!should_chunk_qwen_audio(true, 30 * 16_000));
+        assert!(!should_chunk_qwen_audio(false, 95 * 16_000));
+    }
+
+    #[test]
+    fn apple_speech_locale_maps_language_codes_and_keeps_bcp47() {
+        assert_eq!(apple_speech_locale("auto", "ko-KR"), "ko-KR");
+        assert_eq!(apple_speech_locale("ko", "en-US"), "ko-KR");
+        assert_eq!(apple_speech_locale("en", "ko-KR"), "en-US");
+        assert_eq!(apple_speech_locale("ja-JP", "ko-KR"), "ja-JP");
     }
 
     #[test]
